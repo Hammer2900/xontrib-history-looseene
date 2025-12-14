@@ -24,7 +24,7 @@
 ### Method 1: Standard xpip (Recommended)
 Open xonsh and run:
 ```xsh
-xpip install xontrib-looseene
+xpip install xontrib-history-looseene
 ```
 
 ### Method 2: For Pipx / Unix-managed environments
@@ -43,7 +43,7 @@ xonsh -c "import sys, subprocess; subprocess.check_call([sys.executable, '-m', '
 To activate the backend, add this line to your `.xonshrc` (usually located at `~/.xonshrc` or `~/.config/xonsh/rc.xsh`):
 
 ```python
-xontrib load looseene
+xontrib load history_looseene
 ```
 
 Restart your shell. You should see a message `Looseene: History backend loaded`.
@@ -74,7 +74,7 @@ history-compact
 
 ## 🛠 Technical Details
 
-*   **Storage:** `~/.xonsh/history_search_db/`
+*   **Storage:** `~/.local/share/xonsh/looseene_history`
 *   **Index Structure:** Inverted index with delta-encoded postings lists.
 *   **Backend:** Custom implementation inheriting from `xonsh.history.base.History`.
 
