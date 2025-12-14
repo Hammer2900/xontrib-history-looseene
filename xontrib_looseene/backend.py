@@ -321,7 +321,8 @@ class SearchEngineHistory(History):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.sessionid = str(uuid.uuid4())
-        self.data_dir = os.path.expanduser('~/.xonsh/history_search_db')
+        xdg_data_home = os.environ.get('XDG_DATA_HOME', os.path.expanduser('~/.local/share'))
+        self.data_dir = os.path.join(xdg_data_home, 'xonsh', 'looseene_history')
         with _REGISTRY_LOCK:
             if 'xonsh_search' not in _REGISTRY:
                 _REGISTRY['xonsh_search'] = IndexEngine('xonsh_search', self.data_dir)
