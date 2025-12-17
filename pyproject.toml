@@ -1,7 +1,7 @@
 
 [project]
 name = "xontrib-history-looseene"
-version = "1.0.0"
+version = "1.1.0"
 license = {text = "MIT License"}
 description = "fast small embed history backend"
 classifiers = [

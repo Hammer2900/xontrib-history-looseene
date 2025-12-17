@@ -132,11 +132,23 @@ class DiskSegment:
 
     def close(self):
         if self.mm_postings:
-            self.mm_postings.close()
+            try:
+                self.mm_postings.close()
+            except:
+                pass
+            self.mm_postings = None
         if self.mm_docs:
-            self.mm_docs.close()
+            try:
+                self.mm_docs.close()
+            except:
+                pass
+            self.mm_docs = None
         for f in self.files.values():
-            f.close()
+            try:
+                f.close()
+            except:
+                pass
+        self.files = {}
 
 
 class SegmentWriter:
