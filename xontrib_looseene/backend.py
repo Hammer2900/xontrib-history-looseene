@@ -12,9 +12,10 @@ import heapq
 import time
 import uuid
 import hashlib
-import collections
+from pathlib import Path
 from collections import defaultdict, Counter
-from typing import Dict, List, Tuple, Type, Optional, Set
+from itertools import chain
+from typing import Dict, List, Tuple, Optional, Any, Iterator
 
 try:
     from xonsh.history.base import History
@@ -34,21 +35,15 @@ class TextProcessor:
     SUFFIXES = re.compile(r'(ing|ed|es|ly|er|or|tion|ment|est|al|s)$')
     TOKEN_RE = re.compile(r'\w+')
 
-    @staticmethod
-    def stem(word: str) -> str:
-        if len(word) < 4:
-            return word
-        if word.endswith('ing'):
-            if len(word) < 5:
-                return word
-        return TextProcessor.SUFFIXES.sub('', word)
+    @classmethod
+    def stem(cls, word: str) -> str:
+        """Applies simple stemming rules to a word."""
+        return word if len(word) < 4 or (word.endswith('ing') and len(word) < 5) else cls.SUFFIXES.sub('', word)
 
-    @staticmethod
-    def process(text: str) -> List[str]:
-        if not text:
-            return []
-        raw_words = TextProcessor.TOKEN_RE.findall(text.lower())
-        return [TextProcessor.stem(w) for w in raw_words]
+    @classmethod
+    def process(cls, text: str) -> List[str]:
+        """Tokenizes and stems text using iterators."""
+        return list(map(cls.stem, cls.TOKEN_RE.findall(text.lower()))) if text else []
 
 
 class BM25:
@@ -57,334 +52,258 @@ class BM25:
         self.b = b
 
     def score(self, tf: int, doc_len: int, avg_dl: float, idf: float) -> float:
-        numerator = tf * (self.k1 + 1)
-        denominator = tf + self.k1 * (1 - self.b + self.b * (doc_len / avg_dl))
-        return idf * (numerator / denominator)
+        """Calculates BM25 score."""
+        return idf * ((tf * (self.k1 + 1)) / (tf + self.k1 * (1 - self.b + self.b * (doc_len / avg_dl))))
 
 
 class DiskSegment:
-    def __init__(self, dir_path: str):
-        self.dir_path = dir_path
+    def __init__(self, dir_path: Path):
+        self.path = dir_path
         self.vocab: Dict[str, Tuple[int, int]] = {}
         self.doc_index: Dict[int, Tuple[int, int, int]] = {}
-        self.files = {}
-        self.mm_postings = None
-        self.mm_docs = None
+        self.maps: Dict[str, mmap.mmap] = {}
+        self.files: Dict[str, Any] = {}
         try:
-            p_path = os.path.join(dir_path, 'postings.bin')
-            d_path = os.path.join(dir_path, 'docs.bin')
-            if not os.path.exists(p_path):
-                open(p_path, 'wb').close()
-            if not os.path.exists(d_path):
-                open(d_path, 'wb').close()
-            self.files['postings'] = open(p_path, 'rb')
-            self.files['docs'] = open(d_path, 'rb')
-            if os.path.getsize(p_path) > 0:
-                self.mm_postings = mmap.mmap(self.files['postings'].fileno(), 0, access=mmap.ACCESS_READ)
-            if os.path.getsize(d_path) > 0:
-                self.mm_docs = mmap.mmap(self.files['docs'].fileno(), 0, access=mmap.ACCESS_READ)
+            self._init_resources()
+            self.vocab = (
+                json.loads((self.path / 'vocab.json').read_text('utf-8')) if (self.path / 'vocab.json').exists() else {}
+            )
+            idx = json.loads((self.path / 'doc_idx.json').read_text()) if (self.path / 'doc_idx.json').exists() else {}
+            self.doc_index = {int(k): tuple(v) for k, v in idx.items()}
         except Exception:
             self.close()
             raise
-        self._load_vocab()
-        self._load_doc_index()
 
-    def _load_vocab(self):
-        vp = os.path.join(self.dir_path, 'vocab.json')
-        if os.path.exists(vp):
-            with open(vp, 'r', encoding='utf-8') as f:
-                self.vocab = json.load(f)
+    def _init_resources(self):
+        """Opens files and mmaps resources safely."""
+        for name in ('postings', 'docs'):
+            p = self.path / f'{name}.bin'
+            if not p.exists():
+                p.touch()
+            try:
+                f = p.open('rb')
+                self.files[name] = f
+                if p.stat().st_size > 0:
+                    self.maps[name] = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+            except Exception as e:
+                self.close()
+                raise RuntimeError(f'Failed to initialize {name}: {e}')
 
-    def _load_doc_index(self):
-        dp = os.path.join(self.dir_path, 'doc_idx.json')
-        if os.path.exists(dp):
-            with open(dp, 'r') as f:
-                raw = json.load(f)
-                self.doc_index = {int(k): tuple(v) for k, v in raw.items()}
-
-    def get_postings(self, term: str) -> List[Tuple[int, int]]:
-        if self.mm_postings is None or term not in self.vocab:
-            return []
+    def get_postings(self, term: str) -> Iterator[Tuple[int, int]]:
+        """Yields delta-decoded postings."""
+        if term not in self.vocab or 'postings' not in self.maps:
+            return iter([])
         offset, length = self.vocab[term]
         try:
-            raw_bytes = zlib.decompress(self.mm_postings[offset : offset + length])
-            results = []
-            last_doc_id = 0
-            for delta_id, tf in POSTING_STRUCT.iter_unpack(raw_bytes):
-                doc_id = last_doc_id + delta_id
-                results.append((doc_id, tf))
-                last_doc_id = doc_id
-            return results
+            raw = zlib.decompress(self.maps['postings'][offset : offset + length])
+
+            def _iter():
+                last = 0
+                for d, tf in POSTING_STRUCT.iter_unpack(raw):
+                    last += d
+                    yield last, tf
+
+            return _iter()
         except Exception:
-            return []
+            return iter([])
 
     def get_document(self, doc_id: int) -> Optional[Dict]:
-        if self.mm_docs is None or doc_id not in self.doc_index:
+        """Retrieves document from compressed store."""
+        if doc_id not in self.doc_index or 'docs' not in self.maps:
             return None
         offset, length, _ = self.doc_index[doc_id]
         try:
-            return json.loads(zlib.decompress(self.mm_docs[offset : offset + length]).decode('utf-8'))
+            return json.loads(zlib.decompress(self.maps['docs'][offset : offset + length]).decode('utf-8'))
         except Exception:
             return None
 
     def get_doc_len(self, doc_id: int) -> int:
-        return self.doc_index[doc_id][2] if doc_id in self.doc_index else 0
+        return self.doc_index.get(doc_id, (0, 0, 0))[2]
 
     def close(self):
-        if self.mm_postings:
-            try:
-                self.mm_postings.close()
-            except:
-                pass
-            self.mm_postings = None
-        if self.mm_docs:
-            try:
-                self.mm_docs.close()
-            except:
-                pass
-            self.mm_docs = None
+        """Closes all file handles and mmaps."""
+        for m in self.maps.values():
+            m.close()
         for f in self.files.values():
-            try:
-                f.close()
-            except:
-                pass
-        self.files = {}
+            f.close()
+        self.maps.clear()
+        self.files.clear()
 
 
 class SegmentWriter:
     @staticmethod
-    def write(base_dir: str, seg_id: str, inverted_index: Dict, docs: Dict, doc_lens: Dict):
-        seg_dir = os.path.join(base_dir, f'seg_{seg_id}')
-        os.makedirs(seg_dir, exist_ok=True)
-        vocab, doc_index = {}, {}
-        with open(os.path.join(seg_dir, 'postings.bin'), 'wb') as f_post:
+    def write(base_dir: Path, seg_id: str, inverted: Dict, docs: Dict, doc_lens: Dict) -> Path:
+        """Writes index to disk with delta-encoding."""
+        seg_dir = base_dir / f'seg_{seg_id}'
+        seg_dir.mkdir(parents=True, exist_ok=True)
+        vocab, doc_idx = {}, {}
+        with (seg_dir / 'postings.bin').open('wb') as fp:
             curr = 0
-            for term in sorted(inverted_index.keys()):
-                postings = sorted(inverted_index[term], key=lambda x: x[0])
-                buf = bytearray()
-                last = 0
-                for doc_id, tf in postings:
-                    buf.extend(POSTING_STRUCT.pack(doc_id - last, tf))
-                    last = doc_id
+            for term, posts in sorted(inverted.items()):
+                last, buf = 0, bytearray()
+                for did, tf in sorted(posts):
+                    buf.extend(POSTING_STRUCT.pack(did - last, tf))
+                    last = did
                 comp = zlib.compress(buf)
-                f_post.write(comp)
+                fp.write(comp)
                 vocab[term] = (curr, len(comp))
                 curr += len(comp)
-        with open(os.path.join(seg_dir, 'docs.bin'), 'wb') as f_docs:
+        with (seg_dir / 'docs.bin').open('wb') as fd:
             curr = 0
-            for doc_id, data in docs.items():
+            for did, data in docs.items():
                 comp = zlib.compress(json.dumps(data).encode('utf-8'))
-                f_docs.write(comp)
-                doc_index[doc_id] = (curr, len(comp), doc_lens.get(doc_id, 0))
+                fd.write(comp)
+                doc_idx[did] = (curr, len(comp), doc_lens.get(did, 0))
                 curr += len(comp)
-        with open(os.path.join(seg_dir, 'vocab.json'), 'w', encoding='utf-8') as f:
-            json.dump(vocab, f)
-        with open(os.path.join(seg_dir, 'doc_idx.json'), 'w') as f:
-            json.dump(doc_index, f)
+        (seg_dir / 'vocab.json').write_text(json.dumps(vocab), 'utf-8')
+        (seg_dir / 'doc_idx.json').write_text(json.dumps(doc_idx))
         return seg_dir
 
 
 class IndexEngine:
     def __init__(self, name: str, path: str):
-        self.path = path
-        self.mem_docs = {}
-        self.mem_doc_lens = {}
-        self.mem_inverted = defaultdict(lambda: defaultdict(int))
+        self.path = Path(path)
+        self.mem = {'docs': {}, 'lens': {}, 'inv': defaultdict(lambda: defaultdict(int))}
         self.stats = {'total_docs': 0, 'total_len': 0, 'doc_freqs': Counter()}
-        self.seen_metadata: Dict[str, Dict] = {}
-        self.last_added_hash = None
-        self.last_added_id = None
-        self.segments = []
+        self.seen_meta: Dict[str, Dict] = {}
+        self.last = {'hash': None, 'id': None}
+        self.segments: List[DiskSegment] = []
         self._lock = threading.RLock()
-        if self.path:
-            if not os.path.exists(self.path):
-                os.makedirs(self.path, exist_ok=True)
+        if self.path.exists():
             self._load_stats()
-            self._load_segments()
+            self.segments = [DiskSegment(p) for p in sorted(self.path.glob('seg_*'))]
+        else:
+            self.path.mkdir(parents=True, exist_ok=True)
 
     def _load_stats(self):
         try:
-            with open(os.path.join(self.path, 'stats.json'), 'r') as f:
-                d = json.load(f)
-                self.stats.update(d)
-                self.stats['doc_freqs'] = Counter(d['doc_freqs'])
-                raw_hashes = d.get('seen_hashes', [])
-                if isinstance(raw_hashes, list):
-                    self.seen_metadata = {h: {'cnt': 1, 'cmt': ''} for h in raw_hashes}
-                else:
-                    self.seen_metadata = raw_hashes
-        except:
+            d = json.loads((self.path / 'stats.json').read_text())
+            self.stats.update({k: v for k, v in d.items() if k != 'doc_freqs'})
+            self.stats['doc_freqs'] = Counter(d.get('doc_freqs', {}))
+            hashes = d.get('seen_hashes', [])
+            self.seen_meta = {h: {'cnt': 1, 'cmt': ''} for h in hashes} if isinstance(hashes, list) else hashes
+        except Exception:
             pass
 
     def _save_stats(self):
-        with open(os.path.join(self.path, 'stats.json'), 'w') as f:
-            json.dump({**self.stats, 'seen_hashes': self.seen_metadata}, f)
-
-    def _load_segments(self):
-        for name in sorted(os.listdir(self.path)):
-            if name.startswith('seg_'):
-                try:
-                    self.segments.append(DiskSegment(os.path.join(self.path, name)))
-                except:
-                    pass
-
-    def _get_cmd_hash(self, text: str) -> str:
-        return hashlib.md5(text.strip().encode('utf-8')).hexdigest()
+        (self.path / 'stats.json').write_text(json.dumps({**self.stats, 'seen_hashes': self.seen_meta}))
 
     def add(self, doc: Dict):
+        """Adds doc to memory buffer."""
         cmd = doc.get('inp', '').strip()
         if not cmd:
             return
-        cmd_hash = self._get_cmd_hash(cmd)
+        h = hashlib.md5(cmd.encode('utf-8')).hexdigest()
         with self._lock:
-            meta = self.seen_metadata.get(cmd_hash, {'cnt': 0, 'cmt': ''})
-            if 'cnt' in doc:
-                current_count = doc['cnt']
-            else:
-                current_count = meta['cnt'] + 1
-            new_comment = doc.get('cmt', meta['cmt'])
-            self.seen_metadata[cmd_hash] = {'cnt': current_count, 'cmt': new_comment}
-            if self.last_added_hash == cmd_hash and self.last_added_id in self.mem_docs:
-                self.mem_docs[self.last_added_id]['cnt'] = current_count
-                self.mem_docs[self.last_added_id]['cmt'] = new_comment
+            meta = self.seen_meta.setdefault(h, {'cnt': 0, 'cmt': ''})
+            doc['cnt'] = doc.get('cnt', meta['cnt'] + 1)
+            doc['cmt'] = doc.get('cmt', meta['cmt'])
+            self.seen_meta[h] = {'cnt': doc['cnt'], 'cmt': doc['cmt']}
+            if self.last['hash'] == h and self.last['id'] in self.mem['docs']:
+                self.mem['docs'][self.last['id']].update({'cnt': doc['cnt'], 'cmt': doc['cmt']})
                 return
-            doc['cnt'] = current_count
-            doc['cmt'] = new_comment
-            doc_id = doc['id']
-            self.mem_docs[doc_id] = doc
-            self.last_added_hash = cmd_hash
-            self.last_added_id = doc_id
+            self.mem['docs'][doc['id']] = doc
+            self.last.update({'hash': h, 'id': doc['id']})
             tokens = TextProcessor.process(cmd)
-            self.mem_doc_lens[doc_id] = len(tokens)
-            for t in tokens:
-                self.mem_inverted[t][doc_id] += 1
-                self.stats['doc_freqs'][t] += 1
+            self.mem['lens'][doc['id']] = len(tokens)
             self.stats['total_docs'] += 1
             self.stats['total_len'] += len(tokens)
+            for t in tokens:
+                self.mem['inv'][t][doc['id']] += 1
+                self.stats['doc_freqs'][t] += 1
 
     def flush(self):
+        """Writes memory buffer to disk."""
         with self._lock:
-            if not self.mem_docs:
+            if not self.mem['docs']:
                 return
-            inv = {t: list(d.items()) for t, d in self.mem_inverted.items()}
-            path = SegmentWriter.write(self.path, str(time.time_ns()), inv, self.mem_docs, self.mem_doc_lens)
+            inv_list = {t: list(d.items()) for t, d in self.mem['inv'].items()}
+            path = SegmentWriter.write(self.path, str(time.time_ns()), inv_list, self.mem['docs'], self.mem['lens'])
             self.segments.append(DiskSegment(path))
-            self.mem_docs.clear()
-            self.mem_doc_lens.clear()
-            self.mem_inverted.clear()
-            self.last_added_hash = None
-            self.last_added_id = None
+            for k in self.mem:
+                self.mem[k].clear()
+            self.last.update({'hash': None, 'id': None})
             self._save_stats()
 
     def compact(self):
+        """Merges segments, deduplicates, and cleans up resources."""
         with self._lock:
             self.flush()
             if len(self.segments) < 2:
-                pass
-            print('Looseene: Starting smart compaction...', file=sys.stderr)
-            all_docs = {}
-            all_lens = {}
-            new_inverted = defaultdict(list)
-            merged_map = {}
-            temp_docs_list = []
-            for seg in self.segments:
-                for doc_id in seg.doc_index:
-                    d = seg.get_document(doc_id)
-                    if d:
-                        temp_docs_list.append((doc_id, d, seg.get_doc_len(doc_id)))
-                seg.close()
-            temp_docs_list.sort(key=lambda x: x[0])
-            for doc_id, doc, doc_len in temp_docs_list:
-                cmd = doc.get('inp', '').strip()
-                h = self._get_cmd_hash(cmd)
-                d_cnt = doc.get('cnt', 1)
-                d_cmt = doc.get('cmt', '')
-                if h not in merged_map:
-                    merged_map[h] = {'doc_id': doc_id, 'doc': doc, 'len': doc_len, 'cnt': d_cnt, 'cmt': d_cmt}
-                else:
-                    merged_map[h]['cnt'] = max(merged_map[h]['cnt'], d_cnt)
-                    if d_cmt:
-                        merged_map[h]['cmt'] = d_cmt
-                    merged_map[h]['doc_id'] = doc_id
-                    merged_map[h]['doc'] = doc
-                    merged_map[h]['len'] = doc_len
-            self.seen_metadata = {}
-            for h, meta in merged_map.items():
-                doc_id = meta['doc_id']
-                doc = meta['doc']
-                doc['cnt'] = meta['cnt']
-                doc['cmt'] = meta['cmt']
-                self.seen_metadata[h] = {'cnt': meta['cnt'], 'cmt': meta['cmt']}
-                all_docs[doc_id] = doc
-                all_lens[doc_id] = meta['len']
-                tokens = TextProcessor.process(doc.get('inp', ''))
-                term_counts = Counter(tokens)
-                for term, tf in term_counts.items():
-                    new_inverted[term].append((doc_id, tf))
-            new_seg_id = f'merged_{time.time_ns()}'
-            SegmentWriter.write(self.path, new_seg_id, new_inverted, all_docs, all_lens)
-            for seg in self.segments:
-                if os.path.exists(seg.dir_path):
-                    shutil.rmtree(seg.dir_path)
-            self.segments = []
-            self._load_segments()
+                return
+            all_data = []
+            for s in self.segments:
+                for did in s.doc_index:
+                    doc = s.get_document(did)
+                    if doc:
+                        all_data.append((did, doc, s.get_doc_len(did)))
+            merged, new_inv, all_docs, all_lens = {}, defaultdict(list), {}, {}
+            for s in self.segments:
+                s.close()
+            for doc_id, doc, d_len in sorted(all_data, key=lambda x: x[0]):
+                h = hashlib.md5(doc.get('inp', '').strip().encode('utf-8')).hexdigest()
+                curr = merged.get(h, {'cnt': 0})
+                merged[h] = {
+                    'id': doc_id,
+                    'doc': doc,
+                    'len': d_len,
+                    'cnt': max(curr['cnt'], doc.get('cnt', 1)),
+                    'cmt': doc.get('cmt') or curr.get('cmt', ''),
+                }
+            self.seen_meta.clear()
+            self.stats['total_docs'] = len(merged)
+            self.stats['total_len'] = sum(m['len'] for m in merged.values())
+            self.stats['doc_freqs'] = Counter()
+            for h, m in merged.items():
+                m['doc'].update({'cnt': m['cnt'], 'cmt': m['cmt']})
+                self.seen_meta[h] = {'cnt': m['cnt'], 'cmt': m['cmt']}
+                all_docs[m['id']] = m['doc']
+                all_lens[m['id']] = m['len']
+                for t, tf in Counter(TextProcessor.process(m['doc'].get('inp', ''))).items():
+                    new_inv[t].append((m['id'], tf))
+                    self.stats['doc_freqs'][t] += 1
+            new_seg_path = SegmentWriter.write(self.path, f'merged_{time.time_ns()}', new_inv, all_docs, all_lens)
+            for s in self.segments:
+                shutil.rmtree(s.path)
+            self.segments = [DiskSegment(new_seg_path)]
             self._save_stats()
-            print(f'Looseene: Compaction done. Unique docs: {len(all_docs)}', file=sys.stderr)
 
     def search(self, query: str, limit: int = 10) -> List[Dict]:
-        query_tokens = TextProcessor.process(query)
-        if not query_tokens:
+        """BM25 Search."""
+        tokens = TextProcessor.process(query)
+        if not tokens:
             return []
-        bm25 = BM25()
+        bm25, scores = BM25(), defaultdict(float)
         avg_dl = self.stats['total_len'] / max(1, self.stats['total_docs'])
-        scores = defaultdict(float)
-        for q_term in query_tokens:
-            expanded_terms = set()
-            for mem_term in self.mem_inverted.keys():
-                if mem_term.startswith(q_term):
-                    expanded_terms.add(mem_term)
-            for seg in self.segments:
-                for seg_term in seg.vocab.keys():
-                    if seg_term.startswith(q_term):
-                        expanded_terms.add(seg_term)
-            if not expanded_terms:
-                expanded_terms.add(q_term)
-            for term in expanded_terms:
-                if term not in self.stats['doc_freqs']:
+        for q in tokens:
+            terms = {t for t in self.mem['inv'] if t.startswith(q)} | {
+                t for s in self.segments for t in s.vocab if t.startswith(q)
+            }
+            if not terms:
+                terms = {q}
+            for t in terms:
+                if t not in self.stats['doc_freqs']:
                     continue
                 idf = math.log(
                     1
-                    + (self.stats['total_docs'] - self.stats['doc_freqs'][term] + 0.5)
-                    / (self.stats['doc_freqs'][term] + 0.5)
+                    + (self.stats['total_docs'] - self.stats['doc_freqs'][t] + 0.5) / (self.stats['doc_freqs'][t] + 0.5)
                 )
-                if term in self.mem_inverted:
-                    for doc_id, tf in self.mem_inverted[term].items():
-                        scores[doc_id] += bm25.score(tf, self.mem_doc_lens[doc_id], avg_dl, idf)
-                for seg in self.segments:
-                    for doc_id, tf in seg.get_postings(term):
-                        scores[doc_id] += bm25.score(tf, seg.get_doc_len(doc_id), avg_dl, idf)
-        candidate_limit = limit * 3
-        top_ids = heapq.nlargest(candidate_limit, scores.keys(), key=lambda k: scores[k])
-        results = []
-        seen_hashes = set()
-        for doc_id in top_ids:
-            doc = None
-            if doc_id in self.mem_docs:
-                doc = self.mem_docs[doc_id]
-            else:
-                for seg in reversed(self.segments):
-                    doc = seg.get_document(doc_id)
-                    if doc:
-                        break
+                for did, tf in self.mem['inv'][t].items():
+                    scores[did] += bm25.score(tf, self.mem['lens'][did], avg_dl, idf)
+                for s in self.segments:
+                    for did, tf in s.get_postings(t):
+                        scores[did] += bm25.score(tf, s.get_doc_len(did), avg_dl, idf)
+        results, seen = [], set()
+        for did in heapq.nlargest(limit * 3, scores, key=scores.get):
+            doc = self.mem['docs'].get(did) or next(
+                (d for s in reversed(self.segments) if (d := s.get_document(did))), None
+            )
             if doc:
-                cmd = doc.get('inp', '').strip()
-                h = self._get_cmd_hash(cmd)
-                if h not in seen_hashes:
-                    meta = self.seen_metadata.get(h)
-                    if meta:
-                        doc['cnt'] = meta['cnt']
-                        doc['cmt'] = meta['cmt']
-                    seen_hashes.add(h)
+                h = hashlib.md5(doc.get('inp', '').strip().encode('utf-8')).hexdigest()
+                if h not in seen:
+                    if meta := self.seen_meta.get(h):
+                        doc.update(meta)
+                    seen.add(h)
                     results.append(doc)
                     if len(results) >= limit:
                         break
@@ -395,57 +314,43 @@ class SearchEngineHistory(History):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.sessionid = str(uuid.uuid4())
-        xdg_data_home = os.environ.get('XDG_DATA_HOME', os.path.expanduser('~/.local/share'))
-        self.data_dir = os.path.join(xdg_data_home, 'xonsh', 'looseene_history')
+        path = Path(os.environ.get('XDG_DATA_HOME', Path.home() / '.local/share')) / 'xonsh' / 'looseene_history'
         with _REGISTRY_LOCK:
-            if 'xonsh_search' not in _REGISTRY:
-                _REGISTRY['xonsh_search'] = IndexEngine('xonsh_search', self.data_dir)
-            self.engine = _REGISTRY['xonsh_search']
+            self.engine = _REGISTRY.setdefault('xonsh_search', IndexEngine('xonsh_search', str(path)))
 
-    def append(self, cmd):
-        doc = cmd.copy()
-        doc['id'] = time.time_ns()
-        doc['sessionid'] = self.sessionid
-        doc.pop('out', None)
-        self.engine.add(doc)
+    def append(self, cmd: Dict):
+        self.engine.add({**cmd, 'id': time.time_ns(), 'sessionid': self.sessionid, 'out': None})
         try:
             self.engine.flush()
         except Exception as e:
             print(f'History Err: {e}', file=sys.stderr)
 
-    def items(self, newest_first=False):
-        all_docs = list(self.engine.mem_docs.values())
-        for seg in self.engine.segments:
-            for doc_id in seg.doc_index:
-                d = seg.get_document(doc_id)
-                if d:
-                    all_docs.append(d)
-        all_docs.sort(key=lambda x: x['id'], reverse=newest_first)
-        seen_hashes = set()
-        unique_docs = []
+    def items(self, newest_first=False) -> Iterator[Dict]:
+        src = chain(
+            self.engine.mem['docs'].values(),
+            (d for s in self.engine.segments for did in s.doc_index if (d := s.get_document(did))),
+        )
+        all_docs = sorted(src, key=lambda x: x['id'], reverse=newest_first)
+        seen = set()
         for doc in all_docs:
-            cmd = doc.get('inp', '').strip()
-            h = hashlib.md5(cmd.encode('utf-8')).hexdigest()
-            if h not in seen_hashes:
-                meta = self.engine.seen_metadata.get(h)
-                if meta:
-                    doc['cnt'] = meta['cnt']
-                    doc['cmt'] = meta['cmt']
-                seen_hashes.add(h)
-                unique_docs.append(doc)
-        yield from unique_docs
+            h = hashlib.md5(doc.get('inp', '').strip().encode('utf-8')).hexdigest()
+            if h not in seen:
+                if meta := self.engine.seen_meta.get(h):
+                    doc.update(meta)
+                seen.add(h)
+                yield doc
 
     def all_items(self, newest_first=False):
-        yield from self.items(newest_first)
+        return self.items(newest_first)
 
     def info(self):
-        data = collections.OrderedDict()
-        data['backend'] = 'custom_search_engine'
-        data['sessionid'] = self.sessionid
-        data['location'] = self.data_dir
-        data['docs_in_index'] = self.engine.stats['total_docs']
-        data['segments_count'] = len(self.engine.segments)
-        return data
+        return {
+            'backend': 'looseene',
+            'sessionid': self.sessionid,
+            'location': str(self.engine.path),
+            'docs': self.engine.stats['total_docs'],
+            'segments': len(self.engine.segments),
+        }
 
     def search(self, query, limit=10):
         return self.engine.search(query, limit)
@@ -453,10 +358,6 @@ class SearchEngineHistory(History):
     def run_compaction(self):
         self.engine.compact()
 
-    def update_comment(self, doc_to_update, comment):
-        new_doc = doc_to_update.copy()
-        new_doc['id'] = time.time_ns()
-        new_doc['cmt'] = comment
-        new_doc['cnt'] = doc_to_update.get('cnt', 1)
-        self.engine.add(new_doc)
+    def update_comment(self, doc, comment):
+        self.engine.add({**doc, 'id': time.time_ns(), 'cmt': comment})
         self.engine.flush()
