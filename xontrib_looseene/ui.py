@@ -1,4 +1,5 @@
 import builtins
+import re
 from prompt_toolkit.application import Application
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout.containers import HSplit, Window, VSplit
@@ -39,7 +40,7 @@ async def start_search_ui(event, initial_text=''):
         search_buffer.cursor_position = len(initial_text)
 
     def get_content():
-        query = search_buffer.text
+        query = search_buffer.text.strip()
         if query:
             state['docs'] = history.search(query, limit=20)
         elif not query and (not state['docs'] or len(state['docs']) < 5):
@@ -56,6 +57,15 @@ async def start_search_ui(event, initial_text=''):
             state['selected_index'] = len(state['docs']) - 1
         if state['selected_index'] < 0:
             state['selected_index'] = 0
+        highlight_regex = None
+        if query:
+            tokens = [re.escape(t) for t in query.split() if t]
+            if tokens:
+                pattern = f'({"|".join(tokens)})'
+                try:
+                    highlight_regex = re.compile(pattern, re.IGNORECASE)
+                except re.error:
+                    pass
         fragments = []
         for i, doc in enumerate(state['docs']):
             cmd = doc.get('inp', '').strip()
@@ -70,7 +80,20 @@ async def start_search_ui(event, initial_text=''):
                 prefix = '  '
             fragments.append((prefix_style, prefix))
             fragments.append(('ansiyellow', f'({count}) '))
-            fragments.append((prefix_style, cmd_display))
+            if highlight_regex:
+                parts = highlight_regex.split(cmd_display)
+                for part in parts:
+                    if not part:
+                        continue
+                    if highlight_regex.fullmatch(part):
+                        if i == state['selected_index']:
+                            fragments.append(('reverse ansigreen ansibrightyellow bold', part))
+                        else:
+                            fragments.append(('ansibrightyellow bold', part))
+                    else:
+                        fragments.append((prefix_style, part))
+            else:
+                fragments.append((prefix_style, cmd_display))
             if comment:
                 if len(comment) > 30:
                     comment = comment[:27] + '...'
@@ -126,8 +149,6 @@ async def start_search_ui(event, initial_text=''):
                 query = search_buffer.text
                 if query:
                     state['docs'] = history.search(query, limit=20)
-                else:
-                    pass
 
     results_window = Window(content=result_control, height=Dimension(min=10, max=10), wrap_lines=False)
     search_window = Window(BufferControl(buffer=search_buffer), height=1)

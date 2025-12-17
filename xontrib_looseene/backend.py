@@ -48,7 +48,7 @@ class TextProcessor:
         if not text:
             return []
         raw_words = TextProcessor.TOKEN_RE.findall(text.lower())
-        return [TextProcessor.stem(w) for w in raw_words if len(w) > 1]
+        return [TextProcessor.stem(w) for w in raw_words]
 
 
 class BM25:
@@ -320,23 +320,37 @@ class IndexEngine:
             print(f'Looseene: Compaction done. Unique docs: {len(all_docs)}', file=sys.stderr)
 
     def search(self, query: str, limit: int = 10) -> List[Dict]:
-        tokens = TextProcessor.process(query)
-        if not tokens:
+        query_tokens = TextProcessor.process(query)
+        if not query_tokens:
             return []
         bm25 = BM25()
         avg_dl = self.stats['total_len'] / max(1, self.stats['total_docs'])
         scores = defaultdict(float)
-        for term in tokens:
-            idf = math.log(
-                1
-                + (self.stats['total_docs'] - self.stats['doc_freqs'][term] + 0.5)
-                / (self.stats['doc_freqs'][term] + 0.5)
-            )
-            for doc_id, tf in self.mem_inverted[term].items():
-                scores[doc_id] += bm25.score(tf, self.mem_doc_lens[doc_id], avg_dl, idf)
+        for q_term in query_tokens:
+            expanded_terms = set()
+            for mem_term in self.mem_inverted.keys():
+                if mem_term.startswith(q_term):
+                    expanded_terms.add(mem_term)
             for seg in self.segments:
-                for doc_id, tf in seg.get_postings(term):
-                    scores[doc_id] += bm25.score(tf, seg.get_doc_len(doc_id), avg_dl, idf)
+                for seg_term in seg.vocab.keys():
+                    if seg_term.startswith(q_term):
+                        expanded_terms.add(seg_term)
+            if not expanded_terms:
+                expanded_terms.add(q_term)
+            for term in expanded_terms:
+                if term not in self.stats['doc_freqs']:
+                    continue
+                idf = math.log(
+                    1
+                    + (self.stats['total_docs'] - self.stats['doc_freqs'][term] + 0.5)
+                    / (self.stats['doc_freqs'][term] + 0.5)
+                )
+                if term in self.mem_inverted:
+                    for doc_id, tf in self.mem_inverted[term].items():
+                        scores[doc_id] += bm25.score(tf, self.mem_doc_lens[doc_id], avg_dl, idf)
+                for seg in self.segments:
+                    for doc_id, tf in seg.get_postings(term):
+                        scores[doc_id] += bm25.score(tf, seg.get_doc_len(doc_id), avg_dl, idf)
         candidate_limit = limit * 3
         top_ids = heapq.nlargest(candidate_limit, scores.keys(), key=lambda k: scores[k])
         results = []
@@ -428,7 +442,6 @@ class SearchEngineHistory(History):
         self.engine.compact()
 
     def update_comment(self, doc_to_update, comment):
-        """Helper to add comment to a specific doc (by creating a new version)"""
         new_doc = doc_to_update.copy()
         new_doc['id'] = time.time_ns()
         new_doc['cmt'] = comment
