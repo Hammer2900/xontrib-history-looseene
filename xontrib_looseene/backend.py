@@ -226,7 +226,10 @@ class IndexEngine:
         cmd_hash = self._get_cmd_hash(cmd)
         with self._lock:
             meta = self.seen_metadata.get(cmd_hash, {'cnt': 0, 'cmt': ''})
-            current_count = meta['cnt'] + 1
+            if 'cnt' in doc:
+                current_count = doc['cnt']
+            else:
+                current_count = meta['cnt'] + 1
             new_comment = doc.get('cmt', meta['cmt'])
             self.seen_metadata[cmd_hash] = {'cnt': current_count, 'cmt': new_comment}
             if self.last_added_hash == cmd_hash and self.last_added_id in self.mem_docs:
@@ -351,6 +354,10 @@ class IndexEngine:
                 cmd = doc.get('inp', '').strip()
                 h = self._get_cmd_hash(cmd)
                 if h not in seen_hashes:
+                    meta = self.seen_metadata.get(h)
+                    if meta:
+                        doc['cnt'] = meta['cnt']
+                        doc['cmt'] = meta['cmt']
                     seen_hashes.add(h)
                     results.append(doc)
                     if len(results) >= limit:
@@ -394,6 +401,10 @@ class SearchEngineHistory(History):
             cmd = doc.get('inp', '').strip()
             h = hashlib.md5(cmd.encode('utf-8')).hexdigest()
             if h not in seen_hashes:
+                meta = self.engine.seen_metadata.get(h)
+                if meta:
+                    doc['cnt'] = meta['cnt']
+                    doc['cmt'] = meta['cmt']
                 seen_hashes.add(h)
                 unique_docs.append(doc)
         yield from unique_docs
@@ -415,3 +426,12 @@ class SearchEngineHistory(History):
 
     def run_compaction(self):
         self.engine.compact()
+
+    def update_comment(self, doc_to_update, comment):
+        """Helper to add comment to a specific doc (by creating a new version)"""
+        new_doc = doc_to_update.copy()
+        new_doc['id'] = time.time_ns()
+        new_doc['cmt'] = comment
+        new_doc['cnt'] = doc_to_update.get('cnt', 1)
+        self.engine.add(new_doc)
+        self.engine.flush()

@@ -24,7 +24,8 @@ def _load_xontrib_(xsh, **kwargs):
     def custom_keybindings(bindings, **kw):
         @bindings.add('c-r')
         async def _(event):
-            await start_search_ui(event)
+            current_line = event.current_buffer.text
+            await start_search_ui(event, initial_text=current_line)
 
     def _hsearch(args):
         if not args:
